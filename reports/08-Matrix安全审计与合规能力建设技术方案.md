@@ -1,170 +1,679 @@
-# Matrix 安全审计与合规能力建设技术方案（修订版）
+# Matrix 安全审计与合规能力建设技术方案（v3.0）
 
-## 一、方案概述
+## 一、数据模型设计
 
-**修订说明**：基于 Matrix 现有数据模型（Resource + ResourceVersion），在现有表上扩展状态字段，不新增表。
+### 1.1 整体设计
 
----
-
-## 二、现有数据模型分析
-
-### 2.1 Resource 表（资源元数据）
-
-**当前字段**：
-```java
-- id, workspace_id, type, key, name, description
-- labels (jsonb), metadata (jsonb)
-- current_formal_version, current_gray_version
-- version_count, formal_count, gray_count, draft_count
-- created_at, updated_at
-```
-
-### 2.2 ResourceVersion 表（资源版本）
-
-**当前字段**：
-```java
-- id, resource_id, version
-- status (DRAFT/GRAY/FORMAL/DEPRECATED/ARCHIVED)
-- content, content_size, metadata (jsonb)
-- checksum, gray_config, gray_priority
-- published_at, expires_at, archived_at
-- created_at, last_accessed_at
-```
+| 表名 | 用途 | 设计方式 |
+|------|------|---------|
+| **resource** | 资源元数据 | 扩展字段（audit_config, last_audit_status） |
+| **resource_version** | 资源版本 | 扩展字段（审核状态、关联任务 ID） |
+| **audit_task** | 审核任务 | **新建表**（独立管理审核任务） |
 
 ---
 
-## 三、数据模型扩展方案
+### 1.2 AuditTask 表（新建）
 
-### 3.1 ResourceVersion 表扩展
-
-**新增字段**：
-```sql
-ALTER TABLE resource_version ADD COLUMN audit_status VARCHAR(50);
--- PENDING_REVIEW(待审核), REVIEWING(审核中), APPROVED(已通过), REJECTED(已拒绝)
-
-ALTER TABLE resource_version ADD COLUMN audit_task_id VARCHAR(100);
--- 关联的审核任务 ID
-
-ALTER TABLE resource_version ADD COLUMN audit_result JSONB;
--- 审核结果详情
-
-ALTER TABLE resource_version ADD COLUMN submitted_for_review_at TIMESTAMP;
--- 提交审核时间
-
-ALTER TABLE resource_version ADD COLUMN submitted_for_review_by VARCHAR(100);
--- 提交审核人
-
-ALTER TABLE resource_version ADD COLUMN audited_at TIMESTAMP;
--- 审核完成时间
-
-ALTER TABLE resource_version ADD COLUMN audited_by VARCHAR(100);
--- 审核人
-
-ALTER TABLE resource_version ADD COLUMN rejection_reason TEXT;
--- 拒绝原因
-```
-
-**状态流转**：
-```
-status 字段（生命周期状态）: DRAFT → GRAY → FORMAL → DEPRECATED → ARCHIVED
-audit_status 字段（审核状态）: PENDING_REVIEW → REVIEWING → APPROVED/REJECTED
-```
-
-### 3.2 Resource 表扩展
-
-**新增字段**：
-```sql
-ALTER TABLE resource ADD COLUMN audit_config JSONB;
--- 审核配置（是否启用审核、审核器配置等）
-
-ALTER TABLE resource ADD COLUMN last_audit_status VARCHAR(50);
--- 最新版本的审核状态（冗余字段，便于查询）
-```
-
----
-
-## 四、状态机设计（基于现有模型）
-
-### 4.1 完整状态流转
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                   ResourceVersion 状态机                      │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  DRAFT ──提交审核──→ REVIEWING ──审核通过──→ PENDING_PUBLISH │
-│    │                      │                                    │
-│    │                      └──审核拒绝──→ REJECTED            │
-│    │                      │                                    │
-│    │                      └──审核异常──→ ERROR               │
-│    │                                                         │
-│    └──直接发布（免审）──→ PENDING_PUBLISH ──发布──→ FORMAL   │
-│                                                              │
-│  FORMAL ──下架──→ DEPRECATED ──归档──→ ARCHIVED             │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 状态定义
-
-**status 字段（VersionStatus 枚举）**：
 ```java
-public enum VersionStatus {
-    DRAFT,           // 草稿
-    REVIEWING,       // 审核中（新增）
-    PENDING_PUBLISH, // 待发布（新增）
-    GRAY,            // 灰度
-    FORMAL,          // 正式
-    REJECTED,        // 已拒绝（新增）
-    ERROR,           // 异常（新增）
-    DEPRECATED,      // 已弃用
-    ARCHIVED         // 已归档
+/**
+ * 审核任务实体
+ */
+@Entity
+@Table(name = "audit_task",
+       indexes = {
+           @Index(columnList = "resource_id, version_id"),
+           @Index(columnList = "status"),
+           @Index(columnList = "created_at")
+       })
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class AuditTask {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    /**
+     * 任务编号（业务可见）
+     */
+    @Column(name = "task_no", unique = true, length = 50)
+    private String taskNo;
+
+    /**
+     * 关联资源
+     */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "resource_id", nullable = false)
+    private Resource resource;
+
+    /**
+     * 关联版本
+     */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "version_id", nullable = false)
+    private ResourceVersion version;
+
+    /**
+     * 任务类型
+     */
+    @Column(nullable = false, length = 50)
+    @Enumerated(EnumType.STRING)
+    private TaskType taskType;
+
+    /**
+     * 任务状态
+     */
+    @Column(nullable = false, length = 50)
+    @Enumerated(EnumType.STRING)
+    private TaskStatus status;
+
+    /**
+     * 审核维度（JSON 数组）
+     * ["SENSITIVE_INFO", "CONTENT_SAFETY", "PROMPT_INJECTION"]
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String auditDimensions;
+
+    /**
+     * 审核结果
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String result;
+
+    /**
+     * 审核得分（0-100）
+     */
+    @Column(name = "score")
+    private Integer score;
+
+    /**
+     * 是否通过
+     */
+    @Column(name = "passed")
+    private Boolean passed;
+
+    /**
+     * 拒绝原因
+     */
+    @Column(name = "rejection_reason", columnDefinition = "TEXT")
+    private String rejectionReason;
+
+    /**
+     * 建议修复项（JSON 数组）
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String suggestions;
+
+    /**
+     * 提交人
+     */
+    @Column(name = "submitted_by", length = 100)
+    private String submittedBy;
+
+    /**
+     * 提交时间
+     */
+    @Column(name = "submitted_at")
+    private LocalDateTime submittedAt;
+
+    /**
+     * 审核人
+     */
+    @Column(name = "audited_by", length = 100)
+    private String auditedBy;
+
+    /**
+     * 审核完成时间
+     */
+    @Column(name = "audited_at")
+    private LocalDateTime auditedAt;
+
+    /**
+     * 审核耗时（毫秒）
+     */
+    @Column(name = "audit_duration_ms")
+    private Long auditDurationMs;
+
+    /**
+     * 审计日志（JSON 数组，记录每个审计器的执行结果）
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String auditLogs;
+
+    /**
+     * 元数据
+     */
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(columnDefinition = "jsonb")
+    private String metadata;
+
+    @CreationTimestamp
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+
+    @UpdateTimestamp
+    @Column(name = "updated_at", nullable = false)
+    private LocalDateTime updatedAt;
+
+    /**
+     * 任务类型枚举
+     */
+    public enum TaskType {
+        SUBMIT_REVIEW,      // 提交审核
+        MANUAL_REVIEW,      // 人工复审
+        RANDOM_CHECK,       // 随机抽检
+        RE_AUDIT            // 重新审核
+    }
+
+    /**
+     * 任务状态枚举
+     */
+    public enum TaskStatus {
+        PENDING,            // 待处理
+        IN_PROGRESS,        // 审核中
+        COMPLETED,          // 已完成
+        CANCELLED           // 已取消
+    }
 }
 ```
 
-**audit_status 字段（AuditStatus 枚举）**：
+---
+
+### 1.3 ResourceVersion 表扩展
+
+```java
+// 新增字段
+@Column(name = "audit_status", length = 50)
+@Enumerated(EnumType.STRING)
+private AuditStatus auditStatus;  // PENDING_REVIEW, REVIEWING, APPROVED, REJECTED
+
+@Column(name = "audit_task_id")
+private Long auditTaskId;  // 关联审核任务 ID
+
+@Column(name = "submitted_for_review_at")
+private LocalDateTime submittedForReviewAt;
+
+@Column(name = "submitted_for_review_by", length = 100)
+private String submittedForReviewBy;
+
+@Column(name = "rejection_reason", columnDefinition = "TEXT")
+private String rejectionReason;
+```
+
+**审核状态枚举**：
 ```java
 public enum AuditStatus {
-    PENDING_REVIEW,  // 待审核
-    REVIEWING,       // 审核中
-    APPROVED,        // 已通过
-    REJECTED,        // 已拒绝
-    ERROR            // 异常
+    PENDING_REVIEW,   // 待审核
+    REVIEWING,        // 审核中
+    APPROVED,         // 已通过
+    REJECTED          // 已拒绝
 }
 ```
 
 ---
 
-## 五、审计任务抽象接口（保持不变）
-
-### 5.1 审计器接口
+### 1.4 Resource 表扩展
 
 ```java
-public interface Auditor {
-    Set<ResourceType> getSupportedResourceTypes();
-    Set<AuditDimension> getSupportedDimensions();
-    AuditResult audit(ResourceContent content, AuditContext context);
-    int getPriority();
-}
+// 新增字段
+@JdbcTypeCode(SqlTypes.JSON)
+@Column(name = "audit_config", columnDefinition = "jsonb")
+private String auditConfig;  // 审核配置
+
+@Column(name = "last_audit_status", length = 50)
+private String lastAuditStatus;  // 最新版本的审核状态（冗余字段）
 ```
 
-### 5.2 审计结果
-
-```java
-@Data
-@Builder
-public class AuditResult {
-    private boolean passed;
-    private Integer score;
-    private List<AuditDimensionResult> dimensions;
-    private String rejectionReason;
-    private List<String> suggestions;
+**审核配置示例**：
+```json
+{
+  "enabled": true,
+  "auto_audit": false,
+  "required_dimensions": ["SENSITIVE_INFO", "CONTENT_SAFETY"],
+  "optional_dimensions": ["QUALITY_EVALUATION"],
+  "passing_score": 60,
+  "manual_review_required": true
 }
 ```
 
 ---
 
-## 六、审核维度与实现方式（保持不变）
+## 二、数据库迁移脚本
+
+```sql
+-- 1. 创建 audit_task 表
+CREATE TABLE audit_task (
+    id BIGSERIAL PRIMARY KEY,
+    task_no VARCHAR(50) UNIQUE NOT NULL,
+    resource_id BIGINT NOT NULL REFERENCES resource(id),
+    version_id BIGINT NOT NULL REFERENCES resource_version(id),
+    task_type VARCHAR(50) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    audit_dimensions JSONB,
+    result JSONB,
+    score INTEGER,
+    passed BOOLEAN,
+    rejection_reason TEXT,
+    suggestions JSONB,
+    submitted_by VARCHAR(100),
+    submitted_at TIMESTAMP,
+    audited_by VARCHAR(100),
+    audited_at TIMESTAMP,
+    audit_duration_ms BIGINT,
+    audit_logs JSONB,
+    metadata JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- 创建索引
+CREATE INDEX idx_audit_task_resource_version ON audit_task(resource_id, version_id);
+CREATE INDEX idx_audit_task_status ON audit_task(status);
+CREATE INDEX idx_audit_task_created_at ON audit_task(created_at);
+CREATE INDEX idx_audit_task_submitted_at ON audit_task(submitted_at);
+
+-- 2. ResourceVersion 表扩展
+ALTER TABLE resource_version 
+ADD COLUMN audit_status VARCHAR(50) DEFAULT 'PENDING_REVIEW',
+ADD COLUMN audit_task_id BIGINT REFERENCES audit_task(id),
+ADD COLUMN submitted_for_review_at TIMESTAMP,
+ADD COLUMN submitted_for_review_by VARCHAR(100),
+ADD COLUMN rejection_reason TEXT;
+
+-- 创建索引
+CREATE INDEX idx_resource_version_audit_status ON resource_version(audit_status);
+CREATE INDEX idx_resource_version_audit_task_id ON resource_version(audit_task_id);
+
+-- 3. Resource 表扩展
+ALTER TABLE resource 
+ADD COLUMN audit_config JSONB DEFAULT '{}',
+ADD COLUMN last_audit_status VARCHAR(50);
+
+-- 创建索引
+CREATE INDEX idx_resource_last_audit_status ON resource(last_audit_status);
+
+-- 4. 创建审计日志表（可选，用于详细追踪）
+CREATE TABLE audit_task_log (
+    id BIGSERIAL PRIMARY KEY,
+    task_id BIGINT NOT NULL REFERENCES audit_task(id),
+    auditor_name VARCHAR(100) NOT NULL,
+    auditor_type VARCHAR(50) NOT NULL,  -- AUTO, MANUAL
+    dimension VARCHAR(50) NOT NULL,
+    passed BOOLEAN NOT NULL,
+    score INTEGER,
+    details TEXT,
+    risk_level VARCHAR(20),
+    duration_ms BIGINT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_task_log_task_id ON audit_task_log(task_id);
+```
+
+---
+
+## 三、服务层实现
+
+### 3.1 审核任务服务
+
+```java
+@Service
+public class AuditTaskService {
+    
+    private final AuditTaskRepository taskRepository;
+    private final ResourceVersionRepository versionRepository;
+    private final AuditChainExecutor auditChainExecutor;
+    private final ApplicationEventPublisher eventPublisher;
+    
+    /**
+     * 创建审核任务
+     */
+    @Transactional
+    public AuditTask createTask(ResourceVersion version, String submitterId) {
+        // 生成任务编号
+        String taskNo = generateTaskNo(version.getResource().getType());
+        
+        AuditTask task = AuditTask.builder()
+            .taskNo(taskNo)
+            .resource(version.getResource())
+            .version(version)
+            .taskType(AuditTask.TaskType.SUBMIT_REVIEW)
+            .status(AuditTask.TaskStatus.PENDING)
+            .submittedBy(submitterId)
+            .submittedAt(LocalDateTime.now())
+            .build();
+        
+        AuditTask saved = taskRepository.save(task);
+        
+        // 更新 ResourceVersion 状态
+        version.setAuditStatus(AuditStatus.REVIEWING);
+        version.setAuditTaskId(saved.getId());
+        version.setSubmittedForReviewAt(LocalDateTime.now());
+        version.setSubmittedForReviewBy(submitterId);
+        versionRepository.save(version);
+        
+        // 发布事件（异步执行审核）
+        eventPublisher.publishEvent(new AuditTaskCreatedEvent(this, saved));
+        
+        return saved;
+    }
+    
+    /**
+     * 执行审核（异步）
+     */
+    @Async
+    @Transactional
+    public void executeAudit(AuditTask task) {
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // 更新任务状态
+            task.setStatus(AuditTask.TaskStatus.IN_PROGRESS);
+            taskRepository.save(task);
+            
+            // 构建审计上下文
+            AuditContext context = AuditContext.builder()
+                .resourceId(task.getResource().getId())
+                .resourceType(task.getResource().getType())
+                .workspaceId(task.getResource().getWorkspaceId())
+                .submitterId(task.getSubmittedBy())
+                .build();
+            
+            // 构建资源内容
+            ResourceContent content = ResourceContent.builder()
+                .text(task.getVersion().getContent())
+                .metadata(task.getVersion().getMetadata())
+                .build();
+            
+            // 执行审计链
+            AuditResult result = auditChainExecutor.executeAuditChain(content, context);
+            
+            // 更新任务结果
+            task.setStatus(AuditTask.TaskStatus.COMPLETED);
+            task.setResult(toJson(result));
+            task.setScore(result.getScore());
+            task.setPassed(result.isPassed());
+            task.setRejectionReason(result.isPassed() ? null : result.getRejectionReason());
+            task.setSuggestions(toJson(result.getSuggestions()));
+            task.setAuditedAt(LocalDateTime.now());
+            task.setAuditDurationMs(System.currentTimeMillis() - startTime);
+            
+            taskRepository.save(task);
+            
+            // 更新 ResourceVersion 状态
+            updateVersionStatus(task, result);
+            
+            // 发布事件
+            if (result.isPassed()) {
+                eventPublisher.publishEvent(new AuditApprovedEvent(this, task, result));
+            } else {
+                eventPublisher.publishEvent(new AuditRejectedEvent(this, task, result));
+            }
+            
+        } catch (Exception e) {
+            handleAuditError(task, e, startTime);
+        }
+    }
+    
+    /**
+     * 人工审核
+     */
+    @Transactional
+    public AuditTask manualReview(Long taskId, boolean approved, String reason, String auditorId) {
+        AuditTask task = taskRepository.findById(taskId)
+            .orElseThrow(() -> new AuditTaskNotFoundException(taskId));
+        
+        if (task.getStatus() != AuditTask.TaskStatus.IN_PROGRESS) {
+            throw new IllegalStateException("任务状态不正确");
+        }
+        
+        task.setStatus(AuditTask.TaskStatus.COMPLETED);
+        task.setPassed(approved);
+        task.setScore(approved ? 100 : 0);
+        task.setRejectionReason(approved ? null : reason);
+        task.setAuditedBy(auditorId);
+        task.setAuditedAt(LocalDateTime.now());
+        task.setAuditDurationMs(
+            ChronoUnit.MILLIS.between(task.getSubmittedAt(), LocalDateTime.now())
+        );
+        
+        taskRepository.save(task);
+        
+        // 更新 ResourceVersion 状态
+        ResourceVersion version = task.getVersion();
+        if (approved) {
+            version.setAuditStatus(AuditStatus.APPROVED);
+        } else {
+            version.setAuditStatus(AuditStatus.REJECTED);
+            version.setRejectionReason(reason);
+        }
+        versionRepository.save(version);
+        
+        return task;
+    }
+    
+    /**
+     * 更新版本状态
+     */
+    private void updateVersionStatus(AuditTask task, AuditResult result) {
+        ResourceVersion version = task.getVersion();
+        
+        if (result.isPassed()) {
+            version.setAuditStatus(AuditStatus.APPROVED);
+        } else {
+            version.setAuditStatus(AuditStatus.REJECTED);
+            version.setRejectionReason(result.getRejectionReason());
+        }
+        
+        versionRepository.save(version);
+    }
+    
+    /**
+     * 生成任务编号
+     */
+    private String generateTaskNo(ResourceType resourceType) {
+        String prefix = resourceType.name().substring(0, 3).toUpperCase();
+        String date = LocalDate.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+        String seq = String.format("%05d", getNextSeq());
+        return String.format("AUDIT-%s-%s-%s", prefix, date, seq);
+    }
+    
+    private Long getNextSeq() {
+        // 使用 Redis 或数据库序列生成
+        return redisTemplate.opsForValue().increment("audit_task_seq");
+    }
+}
+```
+
+---
+
+### 3.2 审核查询服务
+
+```java
+@Service
+public class AuditQueryService {
+    
+    private final AuditTaskRepository taskRepository;
+    
+    /**
+     * 分页查询审核任务
+     */
+    public Page<AuditTaskVO> queryTasks(AuditTaskQuery query, Pageable pageable) {
+        return taskRepository.findAll(buildSpecification(query), pageable)
+            .map(this::toVO);
+    }
+    
+    /**
+     * 获取审核任务详情
+     */
+    public AuditTaskDetailVO getTaskDetail(Long taskId) {
+        AuditTask task = taskRepository.findById(taskId)
+            .orElseThrow(() -> new AuditTaskNotFoundException(taskId));
+        
+        return toDetailVO(task);
+    }
+    
+    /**
+     * 统计审核数据
+     */
+    public AuditStatisticsVO getStatistics(LocalDateTime from, LocalDateTime to) {
+        return taskRepository.findStatistics(from, to);
+    }
+    
+    /**
+     * 查询待审核任务列表
+     */
+    public List<AuditTaskVO> getPendingTasks(String workspaceId) {
+        return taskRepository.findByStatusAndWorkspace(
+                AuditTask.TaskStatus.PENDING, workspaceId)
+            .stream()
+            .map(this::toVO)
+            .collect(Collectors.toList());
+    }
+}
+```
+
+---
+
+## 四、API 设计
+
+### 4.1 提交审核
+
+```http
+POST /api/admin/resources/{resourceId}/versions/{versionId}/audit/submit
+
+Request:
+{
+  "submitterId": "user_123",
+  "auditDimensions": ["SENSITIVE_INFO", "CONTENT_SAFETY"]
+}
+
+Response:
+{
+  "code": 200,
+  "data": {
+    "taskId": 789,
+    "taskNo": "AUDIT-PRO-20260311-00001",
+    "status": "IN_PROGRESS",
+    "submittedAt": "2026-03-11T13:00:00Z"
+  }
+}
+```
+
+### 4.2 查询审核任务列表
+
+```http
+GET /api/admin/audit-tasks?status=PENDING&resourceType=prompt&page=0&size=20
+
+Response:
+{
+  "code": 200,
+  "data": {
+    "total": 15,
+    "items": [
+      {
+        "taskId": 789,
+        "taskNo": "AUDIT-PRO-20260311-00001",
+        "resourceType": "prompt",
+        "resourceKey": "customer-service-prompt",
+        "version": "1.0.0",
+        "status": "PENDING",
+        "submittedAt": "2026-03-11T13:00:00Z",
+        "submittedBy": "user_123"
+      }
+    ]
+  }
+}
+```
+
+### 4.3 获取审核任务详情
+
+```http
+GET /api/admin/audit-tasks/{taskId}
+
+Response:
+{
+  "code": 200,
+  "data": {
+    "taskId": 789,
+    "taskNo": "AUDIT-PRO-20260311-00001",
+    "resource": {...},
+    "version": {...},
+    "status": "COMPLETED",
+    "score": 85,
+    "passed": true,
+    "dimensions": [
+      {
+        "name": "敏感信息检测",
+        "passed": true,
+        "score": 100
+      },
+      {
+        "name": "内容安全",
+        "passed": true,
+        "score": 90
+      }
+    ],
+    "auditLogs": [...],
+    "auditDurationMs": 1523
+  }
+}
+```
+
+### 4.4 人工审核
+
+```http
+POST /api/admin/audit-tasks/{taskId}/review
+
+Request:
+{
+  "approved": true,
+  "reason": null,
+  "auditorId": "admin_456"
+}
+
+Response:
+{
+  "code": 200,
+  "data": {
+    "taskId": 789,
+    "status": "COMPLETED",
+    "passed": true,
+    "auditedAt": "2026-03-11T14:00:00Z"
+  }
+}
+```
+
+### 4.5 审核统计
+
+```http
+GET /api/admin/audit-tasks/statistics?from=2026-03-01&to=2026-03-11
+
+Response:
+{
+  "code": 200,
+  "data": {
+    "totalTasks": 150,
+    "completedTasks": 140,
+    "pendingTasks": 10,
+    "passedTasks": 130,
+    "rejectedTasks": 10,
+    "avgScore": 82.5,
+    "avgDurationMs": 1523
+  }
+}
+```
+
+---
+
+## 五、审核维度与实现（保持不变）
 
 | 维度 | 实现方式 | 推荐组件 |
 |------|---------|---------|
@@ -177,333 +686,36 @@ public class AuditResult {
 
 ---
 
-## 七、服务层实现
+## 六、总结
 
-### 7.1 审核服务
+### 数据模型设计
 
-```java
-@Service
-public class AuditService {
-    
-    private final ResourceVersionRepository versionRepository;
-    private final AuditChainExecutor auditChainExecutor;
-    private final ApplicationEventPublisher eventPublisher;
-    
-    /**
-     * 提交审核：DRAFT → REVIEWING
-     */
-    @Transactional
-    public ResourceVersion submitForReview(Long versionId, String userId) {
-        ResourceVersion version = versionRepository.findById(versionId)
-            .orElseThrow(() -> new ResourceNotFoundException(versionId));
-        
-        // 状态校验
-        if (version.getStatus() != VersionStatus.DRAFT) {
-            throw new IllegalStateException("只有草稿版本可以提交审核");
-        }
-        
-        // 更新状态
-        version.setStatus(VersionStatus.REVIEWING);
-        version.setAuditStatus(AuditStatus.REVIEWING);
-        version.setSubmittedForReviewAt(LocalDateTime.now());
-        version.setSubmittedForReviewBy(userId);
-        
-        ResourceVersion saved = versionRepository.save(version);
-        
-        // 发布事件（异步触发审核任务）
-        eventPublisher.publishEvent(new AuditSubmittedEvent(this, saved));
-        
-        return saved;
-    }
-    
-    /**
-     * 执行审核
-     */
-    @Async
-    @Transactional
-    public void executeAudit(ResourceVersion version) {
-        try {
-            // 构建审计上下文
-            AuditContext context = AuditContext.builder()
-                .resourceId(version.getResource().getId())
-                .resourceType(version.getResource().getType())
-                .workspaceId(version.getResource().getWorkspaceId())
-                .submitterId(version.getSubmittedForReviewBy())
-                .build();
-            
-            // 构建资源内容
-            ResourceContent content = ResourceContent.builder()
-                .text(version.getContent())
-                .metadata(version.getMetadata())
-                .build();
-            
-            // 执行审计链
-            AuditResult result = auditChainExecutor.executeAuditChain(content, context);
-            
-            // 更新审核结果
-            if (result.isPassed()) {
-                approveAudit(version.getId(), result, "system");
-            } else {
-                rejectAudit(version.getId(), result.getRejectionReason(), "system");
-            }
-            
-        } catch (Exception e) {
-            handleAuditError(version.getId(), e);
-        }
-    }
-    
-    /**
-     * 审核通过：REVIEWING → APPROVED → PENDING_PUBLISH
-     */
-    @Transactional
-    public ResourceVersion approveAudit(Long versionId, AuditResult result, String auditorId) {
-        ResourceVersion version = versionRepository.findById(versionId)
-            .orElseThrow(() -> new ResourceNotFoundException(versionId));
-        
-        version.setStatus(VersionStatus.PENDING_PUBLISH);
-        version.setAuditStatus(AuditStatus.APPROVED);
-        version.setAuditResult(toJson(result));
-        version.setAuditedAt(LocalDateTime.now());
-        version.setAuditedBy(auditorId);
-        
-        ResourceVersion saved = versionRepository.save(version);
-        
-        eventPublisher.publishEvent(new AuditApprovedEvent(this, saved, result));
-        
-        return saved;
-    }
-    
-    /**
-     * 审核拒绝：REVIEWING → REJECTED
-     */
-    @Transactional
-    public ResourceVersion rejectAudit(Long versionId, String reason, String auditorId) {
-        ResourceVersion version = versionRepository.findById(versionId)
-            .orElseThrow(() -> new ResourceNotFoundException(versionId));
-        
-        version.setStatus(VersionStatus.REJECTED);
-        version.setAuditStatus(AuditStatus.REJECTED);
-        version.setRejectionReason(reason);
-        version.setAuditedAt(LocalDateTime.now());
-        version.setAuditedBy(auditorId);
-        
-        ResourceVersion saved = versionRepository.save(version);
-        
-        eventPublisher.publishEvent(new AuditRejectedEvent(this, saved, reason));
-        
-        return saved;
-    }
-    
-    /**
-     * 发布：PENDING_PUBLISH → FORMAL
-     */
-    @Transactional
-    public ResourceVersion publish(Long versionId, String userId) {
-        ResourceVersion version = versionRepository.findById(versionId)
-            .orElseThrow(() -> new ResourceNotFoundException(versionId));
-        
-        if (version.getStatus() != VersionStatus.PENDING_PUBLISH) {
-            throw new IllegalStateException("只有待发布状态可以发布");
-        }
-        
-        // 检查审核状态
-        if (version.getAuditStatus() != AuditStatus.APPROVED) {
-            throw new IllegalStateException("只有通过审核的版本可以发布");
-        }
-        
-        version.setStatus(VersionStatus.FORMAL);
-        version.setPublishedAt(LocalDateTime.now());
-        
-        ResourceVersion saved = versionRepository.save(version);
-        
-        // 更新 Resource 表的版本统计
-        Resource resource = version.getResource();
-        resource.setCurrentFormalVersion(version.getVersion());
-        resource.setFormalCount(resource.getFormalCount() + 1);
-        resource.setLastAuditStatus(AuditStatus.APPROVED.name());
-        
-        eventPublisher.publishEvent(new ResourcePublishedEvent(this, saved));
-        
-        return saved;
-    }
-}
-```
-
----
-
-## 八、API 设计
-
-### 8.1 提交审核
-
-```http
-POST /api/admin/resources/{resourceId}/versions/{versionId}/audit/submit
-
-Request:
-{
-  "submitterId": "user_123"
-}
-
-Response:
-{
-  "code": 200,
-  "data": {
-    "versionId": 456,
-    "status": "REVIEWING",
-    "auditStatus": "REVIEWING",
-    "submittedAt": "2026-03-11T13:00:00Z"
-  }
-}
-```
-
-### 8.2 审核通过
-
-```http
-POST /api/admin/resources/{resourceId}/versions/{versionId}/audit/approve
-
-Request:
-{
-  "auditorId": "admin_456",
-  "result": {
-    "passed": true,
-    "score": 95,
-    "dimensions": [...]
-  }
-}
-
-Response:
-{
-  "code": 200,
-  "data": {
-    "versionId": 456,
-    "status": "PENDING_PUBLISH",
-    "auditStatus": "APPROVED"
-  }
-}
-```
-
-### 8.3 审核拒绝
-
-```http
-POST /api/admin/resources/{resourceId}/versions/{versionId}/audit/reject
-
-Request:
-{
-  "auditorId": "admin_456",
-  "reason": "发现敏感信息：API Key"
-}
-
-Response:
-{
-  "code": 200,
-  "data": {
-    "versionId": 456,
-    "status": "REJECTED",
-    "auditStatus": "REJECTED",
-    "rejectionReason": "发现敏感信息：API Key"
-  }
-}
-```
-
-### 8.4 发布
-
-```http
-POST /api/admin/resources/{resourceId}/versions/{versionId}/publish
-
-Request:
-{
-  "publisherId": "admin_456"
-}
-
-Response:
-{
-  "code": 200,
-  "data": {
-    "versionId": 456,
-    "status": "FORMAL",
-    "publishedAt": "2026-03-11T14:00:00Z"
-  }
-}
-```
-
----
-
-## 九、数据库迁移脚本
-
-```sql
--- 1. ResourceVersion 表扩展
-ALTER TABLE resource_version 
-ADD COLUMN audit_status VARCHAR(50) DEFAULT 'PENDING_REVIEW',
-ADD COLUMN audit_task_id VARCHAR(100),
-ADD COLUMN audit_result JSONB,
-ADD COLUMN submitted_for_review_at TIMESTAMP,
-ADD COLUMN submitted_for_review_by VARCHAR(100),
-ADD COLUMN audited_at TIMESTAMP,
-ADD COLUMN audited_by VARCHAR(100),
-ADD COLUMN rejection_reason TEXT;
-
--- 2. Resource 表扩展
-ALTER TABLE resource 
-ADD COLUMN audit_config JSONB DEFAULT '{}',
-ADD COLUMN last_audit_status VARCHAR(50);
-
--- 3. 更新 VersionStatus 枚举（PostgreSQL）
-ALTER TYPE version_status ADD VALUE IF NOT EXISTS 'REVIEWING';
-ALTER TYPE version_status ADD VALUE IF NOT EXISTS 'PENDING_PUBLISH';
-ALTER TYPE version_status ADD VALUE IF NOT EXISTS 'REJECTED';
-ALTER TYPE version_status ADD VALUE IF NOT EXISTS 'ERROR';
-
--- 4. 创建索引（加速查询）
-CREATE INDEX idx_resource_version_audit_status ON resource_version(audit_status);
-CREATE INDEX idx_resource_version_submitted_at ON resource_version(submitted_for_review_at);
-CREATE INDEX idx_resource_last_audit_status ON resource(last_audit_status);
-```
-
----
-
-## 十、实施路线图（保持不变）
-
-### Phase 1（0-2 周）：基础框架
-- [ ] 数据库迁移（扩展字段）
-- [ ] 状态机实现
-- [ ] 敏感信息检测（Presidio）
-
-### Phase 2（2-4 周）：核心能力
-- [ ] 内容安全检测（阿里云 API）
-- [ ] Prompt 注入检测（PromptInject）
-- [ ] 审核 API 开发
-
-### Phase 3（4-6 周）：增强能力
-- [ ] 代码安全检测（Semgrep）
-- [ ] 合规检查（Drools）
-- [ ] 审核管理后台
-
-### Phase 4（6-8 周）：优化完善
-- [ ] 审核任务异步化
-- [ ] 审核规则可配置
-- [ ] 审核数据分析与报表
-
----
-
-## 十一、总结
-
-### 修订要点
-
-1. **不新增表** - 在现有 ResourceVersion 表上扩展字段
-2. **双状态设计** - status（生命周期）+ audit_status（审核状态）
-3. **向后兼容** - 不影响现有功能，审核为可选能力
-4. **灵活配置** - 可通过 audit_config 配置是否启用审核
+| 表名 | 设计方式 | 核心字段 |
+|------|---------|---------|
+| **resource** | 扩展字段 | audit_config, last_audit_status |
+| **resource_version** | 扩展字段 | audit_status, audit_task_id, rejection_reason |
+| **audit_task** | **新建表** | 完整记录审核任务全生命周期 |
+| **audit_task_log** | 可选 | 详细审计日志（每个审计器执行结果） |
 
 ### 核心优势
 
-| 设计决策 | 原方案 | 修订方案 |
-|---------|--------|---------|
-| 表结构 | 新增 resource_states 表 | 扩展现有表 |
-| 复杂度 | 高（多表关联） | 低（单表扩展） |
-| 迁移成本 | 高 | 低 |
-| 查询性能 | 中（JOIN） | 高（单表） |
+1. **审核任务独立管理** - 便于追踪、统计、审计
+2. **不破坏现有模型** - Resource 和 ResourceVersion 仅扩展字段
+3. **完整的审核历史** - 每次审核都有独立任务记录
+4. **支持人工审核** - 自动审核 + 人工复审双模式
+5. **灵活配置** - 可配置审核维度、通过分数、是否免审
+
+### 实施优先级
+
+| 阶段 | 工作内容 | 工期 |
+|------|---------|------|
+| **Phase 1** | 数据库迁移 + 基础框架 | 2 周 |
+| **Phase 2** | 敏感信息 + 内容安全检测 | 2 周 |
+| **Phase 3** | Prompt 注入 + 代码安全 | 2 周 |
+| **Phase 4** | 审核管理后台 + 统计报表 | 2 周 |
 
 ---
 
 *方案生成时间：2026 年 3 月 11 日*  
-*版本：v2.0（修订版）*  
-*修订原因：基于 Matrix 现有数据模型优化设计*
+*版本：v3.0*  
+*核心改进：新建 AuditTask 表独立管理审核任务*
