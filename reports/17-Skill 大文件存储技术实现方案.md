@@ -1,296 +1,447 @@
-# Skill 大文件存储技术实现方案
+# Skill 大文件存储技术实现方案（优化版）
 
-## 一、方案概述
+## 一、核心设计优化
 
-### 1.1 存储策略
+### 1.1 ContentRef 简化设计
 
-**混合存储方案**：
-- **<1MB**：存 PostgreSQL（content_inline 字段）
-- **>1MB**：存对象存储 OSS/S3/MinIO（content_ref 字段）
-
-**核心优势**：
-- ✅ 小文件快速访问（DB 直接读取）
-- ✅ 大文件低成本存储（OSS 成本低）
-- ✅ 透明切换（应用层无感知）
-
----
-
-## 二、架构设计
-
-### 2.1 整体架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              Skill 存储架构                                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  应用层 (Matrix Server)                                          │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  SkillService                                             │  │
-│  │    └─ saveSkill() / getSkill()                           │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                            │                                    │
-│                            ▼                                    │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  ContentStorageService (存储抽象层)                        │  │
-│  │    ├─ save(content) → 自动判断存储位置                    │  │
-│  │    └─ get(ref) → 自动读取内容                            │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│           │                              │                      │
-│           ▼                              ▼                      │
-│  ┌─────────────────┐          ┌─────────────────┐             │
-│  │  PostgreSQL     │          │  Object Storage │             │
-│  │  (元数据 + 小文件) │          │  (大文件)        │             │
-│  │  - content_inline│          │  - S3/MinIO/OSS │             │
-│  │  - content_ref   │          │  - CDN 加速      │             │
-│  └─────────────────┘          └─────────────────┘             │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 2.2 存储抽象层设计
-
-**核心接口**：
+**原方案**（冗余）：
 ```java
-public interface ContentStorage {
-    
-    /**
-     * 保存内容
-     * @param content 内容字符串
-     * @param context 上下文信息（用于生成存储 key）
-     * @return 存储引用（DB 路径或 OSS 路径）
-     */
-    ContentRef save(String content, StorageContext context);
-    
-    /**
-     * 读取内容
-     * @param ref 存储引用
-     * @return 内容字符串
-     */
-    String get(ContentRef ref);
-    
-    /**
-     * 删除内容
-     * @param ref 存储引用
-     */
-    void delete(ContentRef ref);
-    
-    /**
-     * 检查内容是否存在
-     * @param ref 存储引用
-     * @return 是否存在
-     */
-    boolean exists(ContentRef ref);
+ContentRef {
+    type: StorageType
+    path: String
+    size: Long           // ❌ 单独字段
+    checksum: String     // ❌ 单独字段
+    contentType: String
+    provider: String     // ❌ 缺失
 }
 ```
 
-**存储引用类**：
+**优化方案**（JSON 化）：
+```java
+ContentRef {
+    provider: String          // ✅ 存储提供者：s3, minio, oss
+    bucket: String            // 存储桶
+    key: String               // 对象键
+    metadata: JsonNode        // ✅ 元数据（size, checksum 等）
+}
+```
+
+**metadata JSON 结构**：
+```json
+{
+  "size": 2048576,
+  "checksum": "sha256:abc123...",
+  "contentType": "text/plain",
+  "createdAt": "2026-03-16T00:00:00Z",
+  "expiresAt": null
+}
+```
+
+---
+
+### 1.2 数据库字段简化
+
+**原方案**（多字段）：
+```sql
+content_inline TEXT,
+content_ref VARCHAR(500),
+content_size BIGINT,
+content_type VARCHAR(100),
+checksum VARCHAR(64)
+```
+
+**优化方案**（单字段）：
+```sql
+-- 小文件：直接存内容
+-- 大文件：存 JSON 引用
+content_data TEXT
+```
+
+**content_data 内容**：
+```json
+{
+  "storage": "inline",
+  "content": "..."
+}
+```
+
+或
+
+```json
+{
+  "storage": "external",
+  "provider": "minio",
+  "bucket": "matrix-skills",
+  "key": "skills/default/123/v1.0.0",
+  "metadata": {
+    "size": 2048576,
+    "checksum": "sha256:abc123...",
+    "contentType": "text/plain",
+    "createdAt": "2026-03-16T00:00:00Z"
+  }
+}
+```
+
+---
+
+## 二、存储提供者抽象
+
+### 2.1 Provider 接口
+
+```java
+public interface StorageProvider {
+    
+    /**
+     * 提供者名称
+     */
+    String getName(); // "s3", "minio", "oss", "local"
+    
+    /**
+     * 保存内容
+     */
+    StorageRef save(byte[] content, StorageContext context);
+    
+    /**
+     * 读取内容
+     */
+    byte[] get(StorageRef ref);
+    
+    /**
+     * 删除内容
+     */
+    void delete(StorageRef ref);
+    
+    /**
+     * 获取下载 URL（用于 CDN/临时访问）
+     */
+    String getDownloadUrl(StorageRef ref, Duration expiry);
+}
+```
+
+### 2.2 StorageRef 设计
+
 ```java
 @Data
 @Builder
 @AllArgsConstructor
-public class ContentRef {
+@NoArgsConstructor
+public class StorageRef {
     
     /**
-     * 存储类型
+     * 存储提供者
      */
-    private StorageType type; // DATABASE 或 OBJECT_STORAGE
+    private String provider; // "s3", "minio", "oss", "local"
     
     /**
-     * 存储路径
-     * - DB: null
-     * - OSS: "oss://bucket/path/to/file"
+     * 存储桶
      */
-    private String path;
+    private String bucket;
     
     /**
-     * 内容大小（字节）
+     * 对象键
      */
-    private Long size;
+    private String key;
     
     /**
-     * SHA-256 校验和
+     * 元数据（JSON）
      */
-    private String checksum;
+    private JsonNode metadata;
     
     /**
-     * 内容类型
+     * 获取大小
      */
-    private String contentType; // "text/plain", "application/json" 等
-    
-    /**
-     * 创建时间
-     */
-    private LocalDateTime createdAt;
-    
-    /**
-     * 是否为内联存储（小文件）
-     */
-    public boolean isInline() {
-        return type == StorageType.DATABASE;
+    public Long getSize() {
+        return metadata.has("size") ? metadata.get("size").asLong() : null;
     }
     
     /**
-     * 是否为外部存储（大文件）
+     * 获取校验和
      */
-    public boolean isExternal() {
-        return type == StorageType.OBJECT_STORAGE;
+    public String getChecksum() {
+        return metadata.has("checksum") ? metadata.get("checksum").asText() : null;
     }
-}
-
-public enum StorageType {
-    DATABASE,       // 数据库存储（小文件）
-    OBJECT_STORAGE  // 对象存储（大文件）
-}
-
-@Data
-@Builder
-public class StorageContext {
     
     /**
-     * 工作空间 ID
+     * 获取内容类型
      */
-    private String workspaceId;
+    public String getContentType() {
+        return metadata.has("contentType") ? metadata.get("contentType").asText() : "text/plain";
+    }
     
     /**
-     * 资源类型
+     * 转为 JSON 存储到 DB
      */
-    private String resourceType; // "skill", "prompt", "mcp"
+    public String toJson() {
+        return JsonUtils.toJson(this);
+    }
     
     /**
-     * 资源 ID
+     * 从 JSON 解析
      */
-    private Long resourceId;
-    
-    /**
-     * 版本号
-     */
-    private String version;
-    
-    /**
-     * 生成存储 key
-     */
-    public String generateKey() {
-        return String.format("%s/%s/%d/%s",
-            resourceType,
-            workspaceId,
-            resourceId,
-            version
-        );
+    public static StorageRef fromJson(String json) {
+        return JsonUtils.fromJson(json, StorageRef.class);
     }
 }
 ```
 
 ---
 
-## 三、核心实现
+## 三、对外接口设计
 
-### 3.1 混合存储实现
+### 3.1 关键问题：应用侧是否需要感知存储？
+
+**答案：不需要！应用侧不应该感知存储细节。**
+
+### 3.2 接口设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **存储透明** | 应用侧只关心内容，不关心存储位置 |
+| **服务端中转** | 所有读写通过 Matrix Server，不直接暴露 OSS |
+| **统一接口** | 无论 DB 还是 OSS，调用方式一致 |
+
+### 3.3 为什么需要服务端中转？
+
+**❌ 错误设计（应用侧直接读 OSS）**：
+```
+应用侧 → 获取 OSS URL → 直接访问 OSS
+         ↓
+      暴露 OSS 凭证
+      无法控制权限
+      无法审计访问
+      无法缓存优化
+```
+
+**✅ 正确设计（服务端中转）**：
+```
+应用侧 → Matrix Server → 读取内容（DB 或 OSS）
+         ↓
+      统一权限控制
+      访问审计日志
+      CDN 缓存优化
+      存储透明
+```
+
+### 3.4 API 设计
 
 ```java
-@Service
-public class HybridContentStorage implements ContentStorage {
+@RestController
+@RequestMapping("/api/resources")
+public class ResourceController {
+    
+    @Autowired
+    private ResourceService resourceService;
     
     /**
-     * 大小阈值：1MB
+     * 获取资源详情（不包含内容）
      */
-    private static final long SIZE_THRESHOLD = 1 * 1024 * 1024;
+    @GetMapping("/{id}")
+    public ResourceDTO getResource(@PathVariable Long id) {
+        // 返回元数据，不返回内容
+        return resourceService.getResource(id);
+    }
     
-    @Autowired
-    private DatabaseStorage databaseStorage;
-    
-    @Autowired
-    private ObjectStorage objectStorage;
-    
-    @Override
-    public ContentRef save(String content, StorageContext context) {
-        byte[] contentBytes = content.getBytes(StandardCharsets.UTF_8);
-        long size = contentBytes.length;
+    /**
+     * 获取资源内容（按需加载）
+     */
+    @GetMapping("/{id}/content")
+    public ResponseEntity<byte[]> getResourceContent(@PathVariable Long id) {
+        byte[] content = resourceService.getContent(id);
         
-        if (size < SIZE_THRESHOLD) {
-            // 小文件：存 DB
-            log.debug("Saving small file (<1MB) to database: size={}", size);
-            return databaseStorage.save(contentBytes, context);
-        } else {
-            // 大文件：存 OSS
-            log.info("Saving large file (>1MB) to object storage: size={}, key={}", 
-                size, context.generateKey());
-            return objectStorage.save(contentBytes, context);
-        }
+        return ResponseEntity.ok()
+            .contentType(MediaType.parseMediaType("text/plain"))
+            .body(content);
     }
     
-    @Override
-    public String get(ContentRef ref) {
-        if (ref.isInline()) {
-            // 从 DB 读取
-            return databaseStorage.get(ref);
-        } else {
-            // 从 OSS 读取
-            return objectStorage.get(ref);
-        }
+    /**
+     * 下载资源内容（带文件名）
+     */
+    @GetMapping("/{id}/download")
+    public ResponseEntity<byte[]> downloadResource(@PathVariable Long id) {
+        ResourceDTO resource = resourceService.getResource(id);
+        byte[] content = resourceService.getContent(id);
+        
+        return ResponseEntity.ok()
+            .contentType(MediaType.parseMediaType("text/plain"))
+            .header(HttpHeaders.CONTENT_DISPOSITION, 
+                "attachment; filename=\"" + resource.getKey() + ".txt\"")
+            .body(content);
     }
     
-    @Override
-    public void delete(ContentRef ref) {
-        if (ref.isInline()) {
-            databaseStorage.delete(ref);
-        } else {
-            objectStorage.delete(ref);
-        }
-    }
-    
-    @Override
-    public boolean exists(ContentRef ref) {
-        if (ref.isInline()) {
-            return databaseStorage.exists(ref);
-        } else {
-            return objectStorage.exists(ref);
-        }
+    /**
+     * 获取临时访问 URL（用于 CDN/前端直传）
+     */
+    @GetMapping("/{id}/upload-url")
+    public UploadUrlDTO getUploadUrl(@PathVariable Long id) {
+        // 仅用于大文件上传场景
+        return resourceService.getUploadUrl(id);
     }
 }
 ```
 
-### 3.2 数据库存储实现
+### 3.5 应用侧调用示例
+
+**Java SDK**：
+```java
+// 获取资源元数据
+ResourceDTO resource = client.getResource(resourceId);
+System.out.println("Key: " + resource.getKey());
+System.out.println("Version: " + resource.getVersion());
+
+// 获取资源内容（透明，不关心存储位置）
+byte[] content = client.getContent(resourceId);
+String code = new String(content, StandardCharsets.UTF_8);
+
+// 或使用流式读取（大文件优化）
+try (InputStream stream = client.getContentStream(resourceId)) {
+    // 处理流式内容
+}
+```
+
+**Python SDK**：
+```python
+# 获取资源元数据
+resource = client.get_resource(resource_id)
+print(f"Key: {resource.key}")
+
+# 获取资源内容（透明）
+content = client.get_content(resource_id)
+code = content.decode('utf-8')
+
+# 或流式读取
+with client.get_content_stream(resource_id) as stream:
+    for chunk in stream:
+        process(chunk)
+```
+
+---
+
+## 四、核心实现
+
+### 4.1 ResourceService 实现
 
 ```java
 @Service
-public class DatabaseStorage implements ContentStorage {
+public class ResourceService {
     
     @Autowired
     private ResourceVersionRepository repository;
     
-    @Override
-    public ContentRef save(byte[] contentBytes, StorageContext context) {
-        String content = new String(contentBytes, StandardCharsets.UTF_8);
-        String checksum = calculateChecksum(contentBytes);
+    @Autowired
+    private StorageProviderManager storageProviderManager;
+    
+    /**
+     * 保存资源
+     */
+    @Transactional
+    public ResourceVersion saveResource(SaveResourceRequest request) {
+        byte[] contentBytes = request.getContent().getBytes(StandardCharsets.UTF_8);
         
-        return ContentRef.builder()
-            .type(StorageType.DATABASE)
-            .path(null) // DB 存储不需要 path
-            .size((long) contentBytes.length)
-            .checksum(checksum)
-            .contentType("text/plain")
-            .createdAt(LocalDateTime.now())
+        // 判断存储方式
+        StorageRef ref;
+        if (contentBytes.length < SIZE_THRESHOLD) {
+            // 小文件：内联存储
+            ref = StorageRef.builder()
+                .provider("inline")
+                .metadata(JsonUtils.createObjectNode()
+                    .put("size", contentBytes.length)
+                    .put("checksum", calculateChecksum(contentBytes))
+                    .put("contentType", "text/plain"))
+                .build();
+        } else {
+            // 大文件：外部存储
+            StorageProvider provider = storageProviderManager.getDefaultProvider();
+            StorageContext context = buildContext(request);
+            ref = provider.save(contentBytes, context);
+        }
+        
+        // 保存到 DB（content_data 字段存 JSON）
+        ResourceVersion version = new ResourceVersion();
+        version.setResourceId(request.getResourceId());
+        version.setVersion(request.getVersion());
+        version.setContentData(ref.toJson());
+        
+        return repository.save(version);
+    }
+    
+    /**
+     * 获取资源内容
+     */
+    public byte[] getContent(Long versionId) {
+        ResourceVersion version = repository.findById(versionId)
+            .orElseThrow(() -> new ResourceNotFoundException(versionId));
+        
+        StorageRef ref = StorageRef.fromJson(version.getContentData());
+        
+        if ("inline".equals(ref.getProvider())) {
+            // 内联存储：从 JSON 中提取内容
+            return extractInlineContent(ref);
+        } else {
+            // 外部存储：从 OSS 读取
+            StorageProvider provider = storageProviderManager.getProvider(ref.getProvider());
+            return provider.get(ref);
+        }
+    }
+    
+    /**
+     * 获取临时上传 URL（用于大文件直传）
+     */
+    public UploadUrlDTO getUploadUrl(Long versionId) {
+        // 仅用于超大文件（>10MB）
+        // 应用侧直传 OSS，完成后回调更新 DB
+        StorageProvider provider = storageProviderManager.getDefaultProvider();
+        String uploadUrl = provider.getUploadUrl(buildContext(versionId));
+        
+        return UploadUrlDTO.builder()
+            .uploadUrl(uploadUrl)
+            .method("PUT")
+            .expiresIn(3600)
             .build();
     }
-    
-    public String get(ContentRef ref) {
-        // 实际从 ResourceVersion 实体中读取 content_inline 字段
-        // 这里只是示例
-        return repository.findById(ref.getResourceId())
-            .map(ResourceVersion::getContentInline)
-            .orElseThrow(() -> new ContentNotFoundException(ref));
-    }
-    
-    // 其他方法实现...
 }
 ```
 
-### 3.3 对象存储实现（MinIO 示例）
+### 4.2 StorageProviderManager
 
 ```java
-@Service
-public class MinioObjectStorage implements ObjectStorage {
+@Component
+public class StorageProviderManager {
+    
+    private final Map<String, StorageProvider> providers = new ConcurrentHashMap<>();
+    
+    @Autowired
+    public StorageProviderManager(List<StorageProvider> providerList) {
+        for (StorageProvider provider : providerList) {
+            providers.put(provider.getName(), provider);
+        }
+    }
+    
+    /**
+     * 获取默认提供者
+     */
+    public StorageProvider getDefaultProvider() {
+        return providers.get("minio"); // 默认 MinIO
+    }
+    
+    /**
+     * 根据名称获取提供者
+     */
+    public StorageProvider getProvider(String name) {
+        StorageProvider provider = providers.get(name);
+        if (provider == null) {
+            throw new IllegalArgumentException("Unknown storage provider: " + name);
+        }
+        return provider;
+    }
+}
+```
+
+### 4.3 MinIO Provider 实现
+
+```java
+@Component
+@ConditionalOnProperty(name = "storage.minio.enabled", havingValue = "true")
+public class MinioStorageProvider implements StorageProvider {
     
     @Autowired
     private MinioClient minioClient;
@@ -299,7 +450,12 @@ public class MinioObjectStorage implements ObjectStorage {
     private String bucket;
     
     @Override
-    public ContentRef save(byte[] contentBytes, StorageContext context) {
+    public String getName() {
+        return "minio";
+    }
+    
+    @Override
+    public StorageRef save(byte[] content, StorageContext context) {
         try {
             String key = context.generateKey();
             
@@ -308,177 +464,149 @@ public class MinioObjectStorage implements ObjectStorage {
                 PutObjectArgs.builder()
                     .bucket(bucket)
                     .object(key)
-                    .stream(new ByteArrayInputStream(contentBytes), contentBytes.length, -1)
+                    .stream(new ByteArrayInputStream(content), content.length, -1)
                     .contentType("text/plain")
                     .build()
             );
             
-            log.info("Uploaded to MinIO: bucket={}, key={}, size={}", 
-                bucket, key, contentBytes.length);
+            // 构建引用
+            ObjectNode metadata = JsonUtils.createObjectNode()
+                .put("size", content.length)
+                .put("checksum", calculateChecksum(content))
+                .put("contentType", "text/plain")
+                .put("createdAt", LocalDateTime.now().toString());
             
-            String checksum = calculateChecksum(contentBytes);
-            
-            return ContentRef.builder()
-                .type(StorageType.OBJECT_STORAGE)
-                .path("oss://" + bucket + "/" + key)
-                .size((long) contentBytes.length)
-                .checksum(checksum)
-                .contentType("text/plain")
-                .createdAt(LocalDateTime.now())
+            return StorageRef.builder()
+                .provider("minio")
+                .bucket(bucket)
+                .key(key)
+                .metadata(metadata)
                 .build();
                 
         } catch (Exception e) {
-            log.error("Failed to upload to MinIO: key={}", context.generateKey(), e);
-            throw new StorageException("Failed to upload to object storage", e);
+            throw new StorageException("Failed to upload to MinIO", e);
         }
     }
     
     @Override
-    public String get(ContentRef ref) {
+    public byte[] get(StorageRef ref) {
         try {
-            String key = extractKey(ref.getPath());
-            
             try (InputStream stream = minioClient.getObject(
                     GetObjectArgs.builder()
-                        .bucket(bucket)
-                        .object(key)
+                        .bucket(ref.getBucket())
+                        .object(ref.getKey())
                         .build()
                 )) {
-                return new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+                return stream.readAllBytes();
             }
-            
         } catch (Exception e) {
-            log.error("Failed to download from MinIO: path={}", ref.getPath(), e);
             throw new ContentNotFoundException(ref);
         }
     }
     
     @Override
-    public void delete(ContentRef ref) {
+    public String getDownloadUrl(StorageRef ref, Duration expiry) {
         try {
-            String key = extractKey(ref.getPath());
-            
-            minioClient.removeObject(
-                RemoveObjectArgs.builder()
-                    .bucket(bucket)
-                    .object(key)
+            return minioClient.getPresignedObjectUrl(
+                GetPresignedObjectUrlArgs.builder()
+                    .method(Method.GET)
+                    .bucket(ref.getBucket())
+                    .object(ref.getKey())
+                    .expiry((int) expiry.getSeconds())
                     .build()
             );
-            
-            log.info("Deleted from MinIO: key={}", key);
-            
         } catch (Exception e) {
-            log.error("Failed to delete from MinIO: path={}", ref.getPath(), e);
-            throw new StorageException("Failed to delete from object storage", e);
+            throw new StorageException("Failed to generate download URL", e);
         }
     }
     
-    @Override
-    public boolean exists(ContentRef ref) {
-        try {
-            String key = extractKey(ref.getPath());
-            
-            minioClient.statObject(
-                StatObjectArgs.builder()
-                    .bucket(bucket)
-                    .object(key)
-                    .build()
-            );
-            
-            return true;
-            
-        } catch (Exception e) {
-            return false;
-        }
-    }
-    
-    private String extractKey(String path) {
-        // "oss://bucket/path/to/file" → "path/to/file"
-        return path.replaceFirst("oss://[^/]+/", "");
-    }
-    
-    private String calculateChecksum(byte[] contentBytes) {
-        return DigestUtils.sha256Hex(contentBytes);
-    }
+    // 其他方法实现...
 }
 ```
 
 ---
 
-## 四、数据库表设计
+## 五、数据库表设计（最终版）
 
-### 4.1 resource_version 表扩展
-
-```sql
--- 添加存储相关字段
-ALTER TABLE resource_version 
-ADD COLUMN content_inline TEXT,              -- 小内容内联存储
-ADD COLUMN content_ref VARCHAR(500),         -- 大内容引用（OSS 路径）
-ADD COLUMN content_size BIGINT DEFAULT 0,    -- 内容大小（字节）
-ADD COLUMN content_type VARCHAR(100) DEFAULT 'text/plain', -- 内容类型
-ADD COLUMN checksum VARCHAR(64);             -- SHA-256 校验和
-
--- 添加索引（优化查询）
-CREATE INDEX idx_resource_version_content_size ON resource_version(content_size);
-CREATE INDEX idx_resource_version_content_ref ON resource_version(content_ref);
-
--- 添加注释
-COMMENT ON COLUMN resource_version.content_inline IS '小内容内联存储（<1MB）';
-COMMENT ON COLUMN resource_version.content_ref IS '大内容引用（>1MB，OSS 路径）';
-COMMENT ON COLUMN resource_version.content_size IS '内容大小（字节）';
-COMMENT ON COLUMN resource_version.content_type IS '内容类型（text/plain, application/json 等）';
-COMMENT ON COLUMN resource_version.checksum IS 'SHA-256 校验和（用于完整性验证）';
-```
-
-### 4.2 存储统计表（可选）
+### 5.1 resource_version 表
 
 ```sql
--- 存储统计信息表
-CREATE TABLE storage_statistics (
+CREATE TABLE resource_version (
     id BIGSERIAL PRIMARY KEY,
+    resource_id BIGINT NOT NULL REFERENCES resource(id),
+    version VARCHAR(50) NOT NULL,
+    status VARCHAR(50) NOT NULL,
     
-    -- 统计维度
-    stat_date DATE NOT NULL,
-    workspace_id VARCHAR(100),
-    resource_type VARCHAR(50),
+    -- 内容存储（JSON 格式）
+    -- 小文件：{"storage":"inline","content":"..."}
+    -- 大文件：{"storage":"external","provider":"minio","bucket":"...","key":"...","metadata":{...}}
+    content_data TEXT,
     
-    -- 存储统计
-    total_count BIGINT DEFAULT 0,           -- 总数量
-    total_size BIGINT DEFAULT 0,            -- 总大小（字节）
-    db_count BIGINT DEFAULT 0,              -- DB 存储数量
-    db_size BIGINT DEFAULT 0,               -- DB 存储大小
-    oss_count BIGINT DEFAULT 0,             -- OSS 存储数量
-    oss_size BIGINT DEFAULT 0,              -- OSS 存储大小
+    -- 元数据
+    metadata JSONB DEFAULT '{}',
+    gray_config JSONB,
+    gray_priority INTEGER DEFAULT 0,
     
-    -- 大小分布
-    size_0_100kb BIGINT DEFAULT 0,          -- 0-100KB
-    size_100kb_1mb BIGINT DEFAULT 0,        -- 100KB-1MB
-    size_1mb_10mb BIGINT DEFAULT 0,         -- 1MB-10MB
-    size_10mb_plus BIGINT DEFAULT 0,        -- 10MB+
-    
+    -- 时间戳
+    published_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    archived_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW(),
+    last_accessed_at TIMESTAMP,
     
-    UNIQUE(stat_date, workspace_id, resource_type)
+    UNIQUE(resource_id, version)
 );
 
--- 每天凌晨 2 点统计
-CREATE INDEX idx_storage_statistics_date ON storage_statistics(stat_date);
+-- 索引
+CREATE INDEX idx_resource_version_resource_id ON resource_version(resource_id);
+CREATE INDEX idx_resource_version_status ON resource_version(status);
+
+-- 注释
+COMMENT ON COLUMN resource_version.content_data IS '内容存储（JSON 格式，内联或外部引用）';
+```
+
+### 5.2 示例数据
+
+**小文件（内联存储）**：
+```json
+{
+  "storage": "inline",
+  "content": "def hello():\n    print('Hello, World!')"
+}
+```
+
+**大文件（外部存储）**：
+```json
+{
+  "storage": "external",
+  "provider": "minio",
+  "bucket": "matrix-skills",
+  "key": "skills/default/123/v1.0.0",
+  "metadata": {
+    "size": 2048576,
+    "checksum": "sha256:abc123...",
+    "contentType": "text/plain",
+    "createdAt": "2026-03-16T00:00:00Z"
+  }
+}
 ```
 
 ---
 
-## 五、配置管理
+## 六、配置管理
 
-### 5.1 application.yml 配置
+### 6.1 application.yml
 
 ```yaml
 storage:
-  # 大小阈值配置
+  # 大小阈值
   threshold:
-    database: 1048576        # 1MB（DB 存储上限）
-    warning: 5242880         # 5MB（超过告警）
-    max: 104857600           # 100MB（绝对上限）
+    inline: 1048576        # 1MB（内联存储上限）
+    warning: 5242880       # 5MB（超过告警）
+    max: 104857600         # 100MB（绝对上限）
+  
+  # 默认提供者
+  default-provider: minio
   
   # MinIO 配置
   minio:
@@ -489,7 +617,7 @@ storage:
     bucket: matrix-skills
     auto-create-bucket: true
   
-  # 阿里云 OSS 配置（备选）
+  # 阿里云 OSS 配置
   oss:
     enabled: false
     endpoint: oss-cn-hangzhou.aliyuncs.com
@@ -497,387 +625,47 @@ storage:
     access-key-secret: ${OSS_ACCESS_KEY_SECRET}
     bucket: matrix-skills
   
-  # AWS S3 配置（备选）
-  s3:
-    enabled: false
-    region: us-east-1
-    bucket: matrix-skills
-  
-  # CDN 配置（加速 OSS 访问）
+  # CDN 配置
   cdn:
     enabled: false
     domain: https://cdn.matrix.ai
-    cache-ttl: 86400  # 24 小时
-  
-  # 监控配置
-  monitoring:
-    enabled: true
-    log-large-files: true  # 记录大文件上传
-    large-file-threshold: 5242880  # 5MB
-```
-
-### 5.2 动态配置（支持运行时调整）
-
-```java
-@Configuration
-@ConfigurationProperties(prefix = "storage")
-@Data
-public class StorageProperties {
-    
-    /**
-     * DB 存储阈值（字节）
-     */
-    private long databaseThreshold = 1048576; // 1MB
-    
-    /**
-     * 告警阈值（字节）
-     */
-    private long warningThreshold = 5242880; // 5MB
-    
-    /**
-     * 最大阈值（字节）
-     */
-    private long maxThreshold = 104857600; // 100MB
-    
-    /**
-     * MinIO 配置
-     */
-    private MinioProperties minio = new MinioProperties();
-    
-    @Data
-    public static class MinioProperties {
-        private boolean enabled = true;
-        private String endpoint = "http://localhost:9000";
-        private String accessKey = "minioadmin";
-        private String secretKey = "minioadmin";
-        private String bucket = "matrix-skills";
-        private boolean autoCreateBucket = true;
-    }
-}
+    cache-ttl: 86400
 ```
 
 ---
 
-## 六、数据迁移方案
+## 七、总结
 
-### 6.1 从纯 DB 迁移到混合存储
+### 7.1 核心优化
 
-**迁移脚本**：
-```java
-@Component
-public class StorageMigrationService {
-    
-    @Autowired
-    private ResourceVersionRepository repository;
-    
-    @Autowired
-    private ContentStorage contentStorage;
-    
-    @Autowired
-    private StorageProperties properties;
-    
-    /**
-     * 迁移大文件到 OSS
-     * 分批处理，避免内存溢出
-     */
-    @Scheduled(cron = "0 0 2 * * ?") // 每天凌晨 2 点
-    @Transactional
-    public void migrateLargeFiles() {
-        long threshold = properties.getDatabaseThreshold();
-        
-        log.info("Starting migration of large files (>{}MB)", threshold / 1024 / 1024);
-        
-        int batchSize = 100;
-        int pageNum = 0;
-        int totalMigrated = 0;
-        
-        while (true) {
-            // 分页查询大文件
-            Page<ResourceVersion> page = repository.findByContentSizeGreaterThanEqual(
-                threshold,
-                PageRequest.of(pageNum, batchSize)
-            );
-            
-            if (page.isEmpty()) {
-                break;
-            }
-            
-            for (ResourceVersion version : page.getContent()) {
-                try {
-                    migrateVersion(version);
-                    totalMigrated++;
-                } catch (Exception e) {
-                    log.error("Failed to migrate version: id={}", version.getId(), e);
-                }
-            }
-            
-            pageNum++;
-        }
-        
-        log.info("Migration completed: totalMigrated={}", totalMigrated);
-    }
-    
-    private void migrateVersion(ResourceVersion version) {
-        String content = version.getContentInline();
-        if (content == null || version.getContentRef() != null) {
-            return; // 已迁移或无内容
-        }
-        
-        // 保存到 OSS
-        StorageContext context = StorageContext.builder()
-            .workspaceId(version.getWorkspaceId())
-            .resourceType(version.getResource().getType().name())
-            .resourceId(version.getResource().getId())
-            .version(version.getVersion())
-            .build();
-        
-        ContentRef ref = contentStorage.save(content, context);
-        
-        // 更新数据库
-        version.setContentRef(ref.getPath());
-        version.setContentInline(null);
-        version.setContentType(ref.getContentType());
-        
-        repository.save(version);
-        
-        log.info("Migrated version to OSS: id={}, size={}, path={}", 
-            version.getId(), ref.getSize(), ref.getPath());
-    }
-}
+| 优化点 | 原方案 | 优化方案 |
+|--------|--------|---------|
+| **ContentRef** | 多字段 | JSON 化（provider + metadata） |
+| **数据库字段** | 5 个字段 | 1 个字段（content_data） |
+| **存储提供者** | 硬编码 | Provider 抽象（可扩展） |
+| **对外接口** | 可能暴露 OSS | 服务端中转（透明） |
+
+### 7.2 设计原则
+
+1. **应用侧透明**：不感知存储细节
+2. **服务端中转**：统一权限控制和审计
+3. **JSON 化**：content_data 存 JSON，灵活扩展
+4. **Provider 抽象**：支持多存储提供者
+
+### 7.3 接口调用流程
+
 ```
-
-### 6.2 回滚方案
-
-```java
-@Service
-public class StorageRollbackService {
-    
-    /**
-     * 回滚指定版本的存储位置
-     * 用于 OSS 故障时临时切回 DB
-     */
-    @Transactional
-    public void rollbackToDatabase(Long versionId) {
-        ResourceVersion version = repository.findById(versionId)
-            .orElseThrow(() -> new ResourceNotFoundException(versionId));
-        
-        if (version.getContentRef() == null) {
-            return; // 已经在 DB 中
-        }
-        
-        // 从 OSS 读取内容
-        String content = contentStorage.get(ContentRef.builder()
-            .path(version.getContentRef())
-            .build());
-        
-        // 存回 DB
-        version.setContentInline(content);
-        version.setContentRef(null);
-        
-        repository.save(version);
-        
-        log.info("Rolled back to database: versionId={}", versionId);
-    }
-}
+应用侧
+  │
+  ├─ getResource(id) ────▶ 返回元数据（不含内容）
+  │
+  └─ getContent(id) ──────▶ Matrix Server ──┬─ DB（小文件）
+                                              │
+                                              └─ OSS（大文件）
 ```
-
----
-
-## 七、监控与告警
-
-### 7.1 指标采集
-
-```java
-@Component
-public class StorageMetrics {
-    
-    private final MeterRegistry meterRegistry;
-    
-    public StorageMetrics(MeterRegistry meterRegistry) {
-        this.meterRegistry = meterRegistry;
-        
-        // 注册指标
-        Gauge.builder("storage.db.size", this, StorageMetrics::getDbSize)
-            .description("Database storage size (bytes)")
-            .baseUnit("bytes")
-            .register(meterRegistry);
-        
-        Gauge.builder("storage.oss.size", this, StorageMetrics::getOssSize)
-            .description("Object storage size (bytes)")
-            .baseUnit("bytes")
-            .register(meterRegistry);
-        
-        Counter.builder("storage.large.file.count")
-            .description("Count of large files (>1MB)")
-            .register(meterRegistry);
-    }
-    
-    private double getDbSize() {
-        // 从数据库统计
-        return repository.sumContentSizeByStorageType("DATABASE");
-    }
-    
-    private double getOssSize() {
-        // 从数据库统计
-        return repository.sumContentSizeByStorageType("OBJECT_STORAGE");
-    }
-}
-```
-
-### 7.2 告警规则
-
-```yaml
-# Prometheus 告警规则
-groups:
-  - name: storage
-    rules:
-      # DB 存储过大告警
-      - alert: DatabaseStorageTooLarge
-        expr: storage_db_size_bytes > 10737418240  # 10GB
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Database storage size is too large"
-          description: "DB storage size is {{ $value }} bytes"
-      
-      # 大文件上传告警
-      - alert: LargeFileUploaded
-        expr: increase(storage_large_file_count[1h]) > 100
-        for: 5m
-        labels:
-          severity: info
-        annotations:
-          summary: "Many large files uploaded"
-          description: "{{ $value }} large files uploaded in last hour"
-      
-      # OSS 存储失败告警
-      - alert: ObjectStorageUploadFailed
-        expr: increase(storage_oss_upload_failed_total[5m]) > 5
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Object storage upload failures"
-          description: "{{ $value }} upload failures in last 5 minutes"
-```
-
----
-
-## 八、性能优化
-
-### 8.1 CDN 加速
-
-```java
-@Service
-public class CdnService {
-    
-    @Autowired
-    private ObjectStorage objectStorage;
-    
-    @Value("${storage.cdn.domain:https://cdn.matrix.ai}")
-    private String cdnDomain;
-    
-    /**
-     * 获取 CDN 加速 URL
-     */
-    public String getCdnUrl(ContentRef ref) {
-        if (!ref.isExternal()) {
-            return null; // DB 存储不支持 CDN
-        }
-        
-        String key = extractKey(ref.getPath());
-        return cdnDomain + "/" + key;
-    }
-    
-    /**
-     * 预加热 CDN 缓存
-     */
-    public void preloadCdn(ContentRef ref) {
-        String cdnUrl = getCdnUrl(ref);
-        if (cdnUrl != null) {
-            // 发起请求预热 CDN
-            restTemplate.getForObject(cdnUrl, String.class);
-            log.info("Preloaded CDN: url={}", cdnUrl);
-        }
-    }
-}
-```
-
-### 8.2 懒加载优化
-
-```java
-@Service
-public class SkillService {
-    
-    /**
-     * 获取 Skill 详情（内容懒加载）
-     */
-    public SkillDTO getSkillDetail(Long id) {
-        ResourceVersion version = repository.findById(id)
-            .orElseThrow(() -> new ResourceNotFoundException(id));
-        
-        SkillDTO dto = toDTO(version);
-        
-        // 不立即加载内容，只返回引用
-        // 前端按需请求内容
-        dto.setLazyLoad(true);
-        dto.setContentRef(version.getContentRef());
-        
-        return dto;
-    }
-    
-    /**
-     * 单独获取内容（按需加载）
-     */
-    public String getSkillContent(Long id) {
-        ResourceVersion version = repository.findById(id)
-            .orElseThrow(() -> new ResourceNotFoundException(id));
-        
-        return contentStorage.get(ContentRef.builder()
-            .path(version.getContentRef())
-            .type(version.getContentRef() != null ? StorageType.OBJECT_STORAGE : StorageType.DATABASE)
-            .build());
-    }
-}
-```
-
----
-
-## 九、总结
-
-### 9.1 实施步骤
-
-**阶段 1：基础建设（1-2 周）**
-- [ ] 添加数据库字段（content_ref, content_size 等）
-- [ ] 实现 ContentStorage 接口
-- [ ] 集成 MinIO/OSS
-
-**阶段 2：迁移工具（1 周）**
-- [ ] 开发数据迁移脚本
-- [ ] 测试迁移流程
-- [ ] 准备回滚方案
-
-**阶段 3：灰度上线（1 周）**
-- [ ] 新 Skill 使用混合存储
-- [ ] 监控指标采集
-- [ ] 配置告警规则
-
-**阶段 4：全量迁移（按需）**
-- [ ] 分批迁移历史大文件
-- [ ] 验证数据完整性
-- [ ] 清理 DB 冗余数据
-
-### 9.2 关键要点
-
-1. **阈值设定**：1MB 是经验值，可根据实际情况调整
-2. **校验和**：必须计算 checksum，确保数据完整性
-3. **监控告警**：实时监控存储大小和失败率
-4. **懒加载**：内容按需加载，提升列表查询性能
-5. **CDN 加速**：大文件访问通过 CDN 加速
 
 ---
 
 *方案生成时间：2026 年 3 月 16 日*  
-*版本：v1.0*  
-*核心洞察：DB+OSS 混合存储，1MB 阈值自动分流，透明切换无感知*
+*版本：v2.0（优化版）*  
+*核心洞察：ContentRef JSON 化、应用侧透明、服务端中转*
