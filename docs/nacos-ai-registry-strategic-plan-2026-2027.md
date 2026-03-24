@@ -67,9 +67,9 @@
 
 | 时间 | 里程碑 | 交付物 |
 |------|--------|--------|
-| **2026-03** | Nacos 3.2 发布 | Prompt/Skill 多版本管理、审核插件、可见性权限 |
+| **2026-03** | Nacos 3.2 发布 | Prompt/Skill/AgentSpec 多版本、审核插件、可见性权限 |
 | **2026-04** | MCP 增强 | MCP 协议优化、工具发现增强 |
-| **2026-05** | Agent 增强 | Agent Card/AgentSpec 管理优化 |
+| **2026-05** | Agent 增强 | Agent 协作编排优化 |
 | **2026-06** | 安全审核体系 | 基于 Harness 方法论的五层约束 |
 
 ### 3.3 核心功能
@@ -210,14 +210,16 @@ spec:
     secretRef: weather-api-key
 ```
 
-#### 3.3.5 Agent Cards Registry（3.2 之前已支持）
+#### 3.3.5 AgentSpec & Agent Cards Registry
 
-**说明**：Nacos 3.2 之前已支持 Agent Card 注册与发现
+**Agent Cards Registry（3.2 之前已支持）**：
+- ✅ Agent Card 注册与发现
+- ✅ 基础版本管理
 
 **3.2 新增能力**：
 - ✅ Agent Card 可见性权限
 - ✅ Agent 审核插件集成
-- ✅ Agent 多版本管理（AgentSpec）
+- ✅ **AgentSpec 多版本管理**（3.2 正式版新增）
 
 **Agent Card 注册**：
 ```yaml
@@ -254,6 +256,7 @@ spec:
 |------|------|------|
 | **Prompt 多版本管理** | ✅ 新增 | 版本控制、灰度发布 |
 | **Skill 多版本管理** | ✅ 新增 | 版本控制、灰度发布 |
+| **AgentSpec 多版本管理** | ✅ 新增 | AgentSpec 版本控制、灰度发布 |
 | **审核插件** | ✅ 新增 | 自定义审核插件 |
 | **可见性权限** | ✅ 新增 | 公开/私有/指定用户 |
 
@@ -262,7 +265,7 @@ spec:
 |------|------|------|
 | **安全审核体系** | 🔄 规划中 | 基于 Harness 五层约束 |
 | **MCP 增强** | 🔄 规划中 | 工具发现、权限控制 |
-| **Agent 增强** | 🔄 规划中 | AgentSpec 多版本 |
+| **Agent 增强** | 🔄 规划中 | Agent 协作编排 |
 
 #### 3.3.7 安全审核体系（3.3 规划）
 
