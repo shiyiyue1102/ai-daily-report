@@ -1,6 +1,6 @@
-Hacker News 热门：OpenAI GPT-5.5 发布 | Symphony 开源编排 | 友好 AI 更容易犯错
+Hacker News 热门：OpenAI GPT-5.5 发布 | Google 400 亿美元投资 Anthropic | Agent 基础设施爆发
 
-注：今日主要新闻来源为 Hacker News、GitHub Trending、OpenAI/Anthropic 官方博客、The Verge。由于部分中文新闻网站访问受限，国内巨头动态基于可验证的公开信息。
+注：今日主要新闻来源为 OpenAI/Anthropic 官方博客、Hacker News、GitHub Trending、Reuters/Bloomberg 报道。由于部分新闻网站访问受限，以下内容基于可验证的公开信息；部分引用外部报道的内容标注待验证。
 
 🌍 国外 Top 5 AI 公司动态
 
@@ -11,59 +11,63 @@ Hacker News 热门：OpenAI GPT-5.5 发布 | Symphony 开源编排 | 友好 AI �
 - 配套发布最强安全措施，含高级网络安全和生物能力专项测试
 - 来源：[OpenAI 官方博客](https://openai.com/index/introducing-gpt-5-5/)
 
-2. OpenAI Symphony 开源编排规范 🔧
+2. Google 计划 400 亿美元投资 Anthropic 📈
 
-- OpenAI 开源 Symphony，将项目管理工具（如 Linear）变成 Coding Agent 的控制平面
-- 每个未完成任务自动分配 Agent，工程师从"监督 Agent"升级为"管理工作"
-- 部分团队落地 PR 数量提升 500%
-- 来源：[OpenAI Engineering Blog](https://openai.com/index/open-source-codex-orchestration-symphony/)
+- Google 计划向 Anthropic 投资高达 400 亿美元，创 AI 领域最大单笔投资纪录之一
+- 此前 Google 已向 Anthropic 投资约 30 亿美元
+- 来源：Reuters 引用 Bloomberg 报道 (2026-04-24)
 
-3. OpenAI 与 Microsoft 修改合作协议 📊
+3. OpenAI 生态开放：Symphony 开源 + AWS 登陆 + 微软协议调整 🌐
 
-- Microsoft 保持主要云合作伙伴地位，但 IP 许可改为非独家（至 2032 年）
-- OpenAI 不再向 Microsoft 支付收入分成，反之收入分成延续至 2030 年但有上限
-- OpenAI 可在任意云服务商上提供产品，走向多云策略
-- 来源：[OpenAI 官方公告](https://openai.com/index/next-phase-of-microsoft-partnership/)
+- Symphony 开源：将项目管理工具（如 Linear）变成 Coding Agent 控制平面，部分团队 PR 数量提升 500%
+- AWS 合作：GPT-5.5、Codex 和 Managed Agents 上线 Amazon Bedrock 预览版
+- 微软协议调整：IP 许可改为非独家（至 2032 年），OpenAI 不再支付收入分成
+- 来源：[OpenAI Engineering Blog](https://openai.com/index/open-source-codex-orchestration-symphony/)、[AWS 联合公告](https://openai.com/index/openai-on-aws/)、[合作更新公告](https://openai.com/index/next-phase-of-microsoft-partnership/)
 
-4. OpenAI 模型正式登陆 AWS 🌐
+4. Anthropic 动态 🏢
 
-- GPT-5.5、Codex 和 Managed Agents 上线 Amazon Bedrock 预览版
-- 超过 400 万人每周使用 Codex，团队覆盖软件全生命周期
-- 企业可在现有 AWS 安全、合规和采购流程中使用 OpenAI 能力
-- 来源：[OpenAI / AWS 联合公告](https://openai.com/index/openai-on-aws/)
+- Claude Design 发布（Anthropic Labs）：支持协作创建设计、原型、幻灯片等视觉作品
+- 【待验证】 reportedly 完成 130 亿美元 F 轮融资，投后估值 1830 亿美元
+- 【待验证】  reportedly 调整 Responsible Scaling Policy，引发业界对 AI 安全标准变化的讨论
+- 来源：[Anthropic 官方新闻](https://www.anthropic.com/news/)（Claude Design）；其他待外部验证
 
-5. Anthropic 推出 Claude Design 🎨
+5. OpenAI 与国防领域合作 🤝
 
-- Anthropic Labs 发布 Claude Design，支持协作创建设计、原型、幻灯片等视觉作品
-- 延续 Anthropic 广告免费策略，保持用户信任优先
-- 来源：[Anthropic 官方新闻](https://www.anthropic.com/news)
+- 【待验证】 reportedly 与国防部达成协议，在机密网络部署模型
+- 若属实，标志着 OpenAI 正式进入政府/国防领域
+- 来源：待外部验证
 
 🇨🇳 国内 AI 巨头动态
 
-1. 大模型开源生态持续活跃 🔓
+1. 阿里巴巴 🔓
 
-- 国内开源模型社区保持活跃，GitHub 上中文 AI 项目关注度稳步增长
-- 来源：GitHub Trending 观察
+- 通义千问 Qwen3 系列持续完善
+- 涵盖 Max、Plus、Flash、Coder-Plus、VL-Plus、Omni-Flash 全场景模型矩阵
+- 来源：通义官方页面 (2026-04)
 
-2. AI 应用落地加速 🏢
+2. 开源社区 🦞
 
-- 国内企业级 AI 应用持续扩展，覆盖客服、内容生成、数据分析等场景
-- 来源：行业综合观察
+- AstrBot 多平台 AI Agent 助手持续热门
+- 集成多 IM 平台、LLM、插件系统
+- 来源：GitHub Trending (2026-04)
 
-3. 算力基础设施持续投入 📦
+3. 开源社区 🦞
 
-- 国内云厂商持续加大 AI 算力投入，支持大模型训练和推理需求
-- 来源：财报及行业分析
+- LangBot 生产级多平台机器人开发平台
+- 支持 Discord / Slack / Telegram / 微信 / 飞书，集成 Claude / Gemini / DeepSeek
+- 来源：GitHub Trending (2026-04)
 
-4. 开发者工具生态建设 🌍
+4. 开源社区 🦞
 
-- 国内 Coding Agent 和 AI 开发工具生态快速发展，与国际趋势同步
-- 来源：GitHub 及开发者社区
+- wechat-bot 支持 ChatGPT / Claude / Kimi / DeepSeek 多 AI 服务
+- 社群分析、好友管理、僵尸粉检测等功能
+- 来源：GitHub Trending (2026-04)
 
-5. AI 安全与合规关注提升 🔒
+5. 华为 📡
 
-- 随着大模型能力增强，国内对 AI 安全、数据合规的讨论持续升温
-- 来源：政策及行业动态
+- 盘古大模型生态持续扩展
+- 企业级 AI 解决方案在制造、金融、政务领域落地加速
+- 来源：行业观察 (2026-04)
 
 🔬 新技术与项目
 
@@ -110,45 +114,47 @@ Hacker News 热门：OpenAI GPT-5.5 发布 | Symphony 开源编排 | 友好 AI �
 
 📊 趋势观察
 
-1. Agent 编排成为工程新焦点 🎯
+1. AI 投资进入千亿美元级别 💰
 
-- OpenAI Symphony 将 Linear 等工具变为 Agent 控制平面
-- 从"工程师监督 Agent"转向"工程师管理工作"
+- Google 计划 400 亿美元投资 Anthropic，AI 基础设施军备竞赛白热化
+- 大规模资本涌入加速模型能力和计算资源扩张
+- 商业化与安全之间的张力持续加大
+
+2. Agent 编排与基础设施爆发 🎯
+
+- OpenAI Symphony 将 Linear 等工具变为 Agent 控制平面，工程师从"监督 Agent"转向"管理工作"
+- Warp 终端 Agent 化，开发环境从 IDE 向 Agentic 演进
+- Codex Skills 生态快速扩展（mattpocock、Composio 等），400 万周活用户催生繁荣周边
 - 反映行业从单 Agent 交互向多 Agent 协作编排演进
 
-2. OpenAI 走向开放与多云 ☁️
+3. OpenAI 走向开放与多云 ☁️
 
 - 修改 Microsoft 协议为非独家，登陆 AWS Bedrock
 - 开源 Symphony 规范，推动行业标准化
-- 策略从封闭独占转向生态共赢
-
-3. Coding Agent 工具链爆发 🔥
-
-- GitHub Trending 今日大量 Coding Agent 相关项目上榜
-- warp、skills、awesome-codex-skills、jcode 等代表终端、Skills、API 中间件全链路创新
-- 400 万周活 Codex 用户催生繁荣周边生态
+- 策略从封闭独占转向生态共赢，企业客户获得更多部署选择
 
 4. AI 安全悖论浮现 ⚠️
 
-- Nature 发表研究：温暖友好的聊天机器人更容易犯错、更可能同意错误信念
 - GPT-5.5 配套发布最强安全措施，含高级网络安全和生物能力测试
-- 能力与安全的平衡持续成为行业核心议题
+- 【待验证】Anthropic  reportedly 调整安全政策，引发业界讨论
+- 能力与安全的平衡持续成为行业核心议题，监管框架尚未完全跟上
 
 💬 一句话总结
 
-"从监督 Agent 到编排工作，AI 正在从工具进化为可管理的团队成员。"
+"从监督 Agent 到编排工作，从封闭生态到多云开放，AI 正在从工具进化为可管理的团队成员——但投资狂欢时，安全这条弦不能松。"
 
 📅 明日关注
 
 - GPT-5.5 API 大规模开放进展
 - Symphony 社区采用情况及第三方实现
+- Google 400 亿美元投资 Anthropic 后续进展
 - AWS Bedrock 上 OpenAI 模型的企业反馈
-- 更多 AI 安全研究动态
+- 国内 AI 公司 Q2 产品发布节奏
 
 ---
 
-本报告基于 2026 年 4 月 29 日 Hacker News、GitHub Trending、OpenAI/Anthropic 官方博客等公开信息整理
+本报告基于 2026 年 4 月 29 日 Hacker News、GitHub Trending、OpenAI/Anthropic 官方博客、Reuters/Bloomberg 报道等公开信息整理
 
-数据来源：Hacker News、GitHub、OpenAI Blog、Anthropic News、The Verge、AWS Blog
+数据来源：Hacker News (Algolia API)、GitHub、OpenAI Blog、Anthropic News、The Verge、AWS Blog、Reuters、Bloomberg
 
-注：部分新闻网站访问受限，国内巨头动态基于可验证的公开信息；Hacker News 数据通过 Algolia API 获取
+注：部分新闻网站访问受限，【待验证】内容基于外部报道引用但未经直接验证；其余内容基于可验证的公开信息
